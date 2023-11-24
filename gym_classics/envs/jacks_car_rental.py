@@ -17,7 +17,7 @@ class JacksCarRental(BaseEnv):
 
     **state:** The number of cars at both lots.
 
-    **actions:** Move a number of cars {-5, ..., 5} for a total of 9 actions. Positive
+    **actions:** Move a number of cars {-5, ..., 5} for a total of 11 actions. Positive
     numbers represent moving cars from lot 1 to lot 2; negative numbers represent moving
     cars from lot 2 to lot 1.
 
@@ -26,7 +26,10 @@ class JacksCarRental(BaseEnv):
     **termination:** 100 timesteps elapse.
     """
 
-    def __init__(self):
+    def __init__(self, size_lot=20, swap_lots_max=5):
+        self.size_lot = size_lot
+        self.swap_lots_max = swap_lots_max
+
         # Poission distributions for requests and dropoffs at both lots
         self._lot1_requests_distr = TruncatedPoisson(3)
         self._lot1_dropoffs_distr = TruncatedPoisson(3)
@@ -34,32 +37,54 @@ class JacksCarRental(BaseEnv):
         self._lot2_dropoffs_distr = TruncatedPoisson(2)
 
         # Precompute the factored transition and reward functions for both lots
-        self.P1, self.R1 = open_to_close(self._lot1_requests_distr, self._lot1_dropoffs_distr)
-        self.P2, self.R2 = open_to_close(self._lot2_requests_distr, self._lot2_dropoffs_distr)
+        self.P1, self.R1 = open_to_close(
+            self._lot1_requests_distr,
+            self._lot1_dropoffs_distr,
+            self.size_lot,
+            self.swap_lots_max,
+        )
+        self.P2, self.R2 = open_to_close(
+            self._lot2_requests_distr,
+            self._lot2_dropoffs_distr,
+            self.size_lot,
+            self.swap_lots_max,
+        )
 
         # Bypass the search for reachable states because we know the whole grid is valid
-        states = [(i, j) for i in range(21) for j in range(21)]
-        super().__init__(starts={(10, 10)}, n_actions=11, reachable_states=states)
+        states = [(i, j) for i in range(size_lot + 1) for j in range(size_lot + 1)]
+        super().__init__(
+            starts={(swap_lots_max * 2, swap_lots_max * 2)},
+            n_actions=(swap_lots_max * 2) + 1,
+            reachable_states=states,
+        )
 
     def reset(self, seed=None, options=None):
         # Make sure each distribution has access to the np_random module
-        for distr in [self._lot1_requests_distr, self._lot1_dropoffs_distr,
-                      self._lot2_requests_distr, self._lot2_dropoffs_distr]:
+        for distr in [
+            self._lot1_requests_distr,
+            self._lot1_dropoffs_distr,
+            self._lot2_requests_distr,
+            self._lot2_dropoffs_distr,
+        ]:
             distr.np_random = self.np_random
         return super().reset(seed)
 
     def step(self, action):
         assert self.action_space.contains(action)
         state = self.state
-        action = decode_action(action)
+        action = decode_action(action, self.swap_lots_max)
 
         next_state = move_cars(state, action)
 
         requests, dropoffs = self._sample_random_elements()
         for i in range(len(next_state)):
-            next_state[i] = handle_requests_and_dropoffs(next_state[i], requests[i], dropoffs[i])
+            next_state[i] = handle_requests_and_dropoffs(
+                next_state[i], requests[i], dropoffs[i], size_lot=self.size_lot
+            )
 
-        next_state, reward, done, _ = self._deterministic_step(state, action, next_state)
+        next_state, reward, done, _ = self._deterministic_step(
+            state, action, next_state
+        )
         self.state = next_state
         return self.encode(next_state), reward, done, False, {}
 
@@ -76,8 +101,10 @@ class JacksCarRental(BaseEnv):
         state_after_move = move_cars(state, action)
 
         # Both lots evolve independently so we can multiply these to get the transition probability
-        prob = self.P1[state_after_move[0]][next_state[0]] \
-             * self.P2[state_after_move[1]][next_state[1]]
+        prob = (
+            self.P1[state_after_move[0]][next_state[0]]
+            * self.P2[state_after_move[1]][next_state[1]]
+        )
 
         reward = self._reward(state_after_move, action)
         done = self._done()
@@ -100,7 +127,7 @@ class JacksCarRental(BaseEnv):
         return False  # Environment has no terminal state
 
     def _generate_transitions(self, state, action):
-        action = decode_action(action)
+        action = decode_action(action, self.swap_lots_max)
         for next_state in self.states():
             next_state = self.decode(next_state)
             yield self._deterministic_step(state, action, next_state)
@@ -116,6 +143,7 @@ class JacksCarRentalModified(JacksCarRental):
 
     **reference:** cite{3} (page 82, exercise 4.7).
     """
+
     def _reward(self, state_after_move, action):
         reward = super()._reward(state_after_move, action)
 
@@ -158,9 +186,9 @@ class TruncatedPoisson:
         return self.np_random.choice(self.domain, p=self.Pr)
 
 
-def decode_action(i):
+def decode_action(i, swap_lots_max=5):
     # Convert the integer to a +/- delta representing the cars moved from lot 1 to 2
-    return i - 5
+    return i - swap_lots_max
 
 
 def move_cars(state, action):
@@ -169,31 +197,34 @@ def move_cars(state, action):
     return [state[0] - moved_cars, state[1] + moved_cars]
 
 
-def handle_requests_and_dropoffs(cars, requests, dropoffs):
+def handle_requests_and_dropoffs(cars, requests, dropoffs, size_lot=20):
     # We can satisfy as many requests as we have cars available
     satisfied_requests = min(cars, requests)
     # Can't have more than 20 cars at the end of the day
-    return clip(cars + dropoffs - satisfied_requests, 0, 20)
+    return clip(cars + dropoffs - satisfied_requests, 0, size_lot)
 
 
-def open_to_close(requests_distr, dropoffs_distr):
+def open_to_close(requests_distr, dropoffs_distr, size_lot=20, swap_lots_max=5):
     """Calculates the transition function P and the reward function R over the two
     Poisson distributions: i.e. requests and dropoffs. Since the Poisson distribution's
     domain is infinite, the calculation is terminated within the given precision."""
-    P = np.zeros((26, 21), dtype=np.float32)
-    R = np.zeros(26)
+    n_cars = size_lot + swap_lots_max + 1
+    P = np.zeros((n_cars, size_lot + 1), dtype=np.float32)
+    R = np.zeros(n_cars)
 
     # How many cars were requested
     for requests, request_prob in requests_distr:
         # We can have up to 25 starting cars (20 capacity + 5 sent over)
-        for n in range(26):
+        for n in range(n_cars):
             # Expected reward: 10 * expected number rented out
-            R[n] += (10.0 * request_prob * min(requests, n))
+            R[n] += 10.0 * request_prob * min(requests, n)
 
         # How many cars were returned
         for dropoffs, dropoff_prob in dropoffs_distr:
-            for n in range(26):
-                new_n = handle_requests_and_dropoffs(n, requests, dropoffs)
+            for n in range(n_cars):
+                new_n = handle_requests_and_dropoffs(
+                    n, requests, dropoffs, size_lot=size_lot
+                )
                 # Increment the transition probability
                 P[n][new_n] += request_prob * dropoff_prob
 
